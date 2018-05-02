@@ -12,3 +12,6 @@ Rscript -e "rmarkdown::render('caret_analysis.Rmd')"
 ```
 
 The results of this command are in `caret_analysis.html`
+
+<a href="https://doi.org/10.5281/zenodo.1239421"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.1239421.svg" alt="DOI"></a>
+
