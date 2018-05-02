@@ -1,0 +1,412 @@
+---
+title: "caret tuning analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+  html_notebook: default
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=FALSE,
+                      message=FALSE,
+                      warning=FALSE)
+library(knitr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(reshape2)
+library(pROC)
+library(glmnet)
+library(e1071)
+library(randomForest)
+library(gbm)
+library(scales)
+library(icd)
+library(caret)
+library(ggsci)
+library(gridExtra)
+
+# https://stackoverflow.com/questions/3443687/formatting-decimal-places-in-r
+specify_decimal <- function(x, k) trimws(format(round(x, k), nsmall=k))
+```
+
+# Load data
+
+```{r load_data}
+models <- c("glmnet","rf","svmLinear2","gbm", "nnet")
+labels=c("GBM","LR","ANN","RF","SVM")
+
+load_models <- function(models, suffix="") {
+  res <- list(fits=list(),
+              aucs=c(),
+              awol_aucs=c(),
+              preds=list(),
+              awol_preds=list())
+  for (model in models) {
+    load(sprintf("rda/models/%s%s.Rda", model, suffix))
+    res[[c("fits", model)]] <- model_res$fit
+    res[["aucs"]][model] <- model_res$aucs
+    res[["awol_aucs"]][model] <- model_res$awol_aucs
+    res[[c("preds", model)]] <- model_res$preds
+    res[[c("awol_preds", model)]] <- model_res$awol_preds
+  }
+  return(res)
+}
+
+# load models trained with Nu-DESC>=2 outcome
+res <- load_models(models, suffix="")
+# load models trained with Nu-DESC>=1 outcome
+res_nudesc1 <- load_models(models, suffix="_nudesc1")
+# load vector of AWOL scores for test data
+load("rda/awol_test.rda")
+# load dataframe of outcomes all test data, with or without AWOL score
+load("rda/test_awol.rda")
+load("rda/test_awol_nudesc1.rda")
+# load vectors of delirium outcome for test data
+load("rda/test_delirium.rda")
+load("rda/test_delirium_nudesc1.rda")
+```
+```{r print_confusion_matrices_fn}
+# print to console confusion matrices at multiple sensitivity and specificity thresholds
+print_confusion_matrices <- function(model, thresholds=c(0.95, 0.9)) {
+  preds <- data.frame(response=test_delirium,
+                      predictor=as.numeric(res$preds[[c(model,"Yes")]]))
+  model_roc <- roc(response=preds$response,
+                   predictor=preds$predictor)
+  for (threshold in thresholds) {
+    # print confusion matrices at sensitivity thresholds
+    sens_idx <- max(which(model_roc$sensitivities > threshold))
+    sens_threshold <- model_roc$thresholds[sens_idx]
+    print(sprintf("%s sensitivity threshold: %s probability of delirium", threshold, percent(sens_threshold)))
+    invis <- print_confusion_matrix(preds$response, preds$predictor, sens_threshold)
+    
+    # print confusion matrices at specificity thresholds
+    spec_idx <- min(which(model_roc$specificities > threshold))
+    spec_threshold <- model_roc$thresholds[spec_idx]
+    print(sprintf("%s specificity threshold: %s probability of delirium", threshold, percent(spec_threshold)))
+    invis <- print_confusion_matrix(preds$response, preds$predictor, spec_threshold)
+  }
+}
+
+# print confusion matrix to console at given threshold, as well as number needed to treat
+print_confusion_matrix <- function(response, predictor, threshold) {
+  pred <- factor(ifelse(predictor > threshold, "delirium", "no delirium"))
+  truth <- factor(ifelse(as.character(response)=="Yes", "delirium", "no delirium"))
+  cm <- confusionMatrix(pred, truth)
+  print(cm)
+  a <- cm$table[1,1]
+  b <- cm$table[1,2]
+  c <- cm$table[2,1]
+  d <- cm$table[2,2]
+  RT <- a/(a+b)
+  RNT <- c/(c+d)
+  ARR <- abs(RT - RNT)
+  NNT <- 1/ARR
+  print(sprintf("Number needed to treat: %s", specify_decimal(NNT, k=1)))
+  return(pred)
+}
+```
+
+# Hyperparameter tuning
+
+## Nu-DESC > 1
+```{r plot_caret_results}
+for (model in models) {
+  if (model=="nnet") next
+  res[[c("fits", model)]] %>% plot(main=model) %>% print()
+}
+```
+
+## Nu-DESC > 0
+```{r plot_caret_results_nudesc1}
+for (model in models) {
+  if (model=="nnet") next
+  res_nudesc1[[c("fits", model)]] %>% plot(main=model) %>% print()
+}
+```
+
+
+# Test performance - Nu-DESC > 1
+
+We compare the performance of each best cross-validated model on the test data. There are  `r nrow(res$test)` test examples.
+
+## AUCs
+```{r plot_aucs}
+awol_roc <- pROC::roc(as.numeric(test_awol$delirium), as.numeric(test_awol$first_awol), plot=FALSE)
+awol_auc <- awol_roc$auc
+
+df <- data.frame(model=c(rep(names(res$aucs), 2), "AWOL"),
+                 AUC=c(res$aucs, res$awol_aucs, awol_auc),
+                 data=c(rep("All", length(models)),rep("AWOL", length(models) + 1)))
+ggplot(df, aes(model, AUC, fill=data)) +
+  geom_bar(stat="identity", position="dodge") +
+  geom_text(aes(label=round(AUC,3)), position=position_dodge(width=0.9), vjust=-0.25) +
+  theme_bw() +
+  scale_fill_jama() +
+  scale_x_discrete(labels=c("AWOL",labels))
+```
+
+## ROC curves - all data
+```{r all_roc}
+sensitivities <- c()
+specificities <- c()
+thresholds <- c()
+model_names <- c()
+for (model_name in models) {
+  test_preds <- data.frame(response=test_delirium,
+                           prediction=as.numeric(res$preds[[model_name]]$Yes))
+  test_roc <- roc(test_preds$response, test_preds$prediction)
+  sensitivities <- c(sensitivities, test_roc$sensitivities)
+  specificities <- c(specificities, test_roc$specificities)
+  thresholds <- c(thresholds, test_roc$thresholds)
+  model_names <- c(model_names, rep(model_name, length(test_roc$thresholds)))
+}
+
+all_roc <- data.frame(sens=sensitivities,
+                      spec=specificities,
+                      thresholds=thresholds,
+                      model=model_names)
+
+ggplot(all_roc, aes(spec, sens, color=model)) +
+  geom_line() +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  theme_bw() +
+  coord_fixed() +
+  scale_color_jama(name="Model", labels=labels)
+```
+
+## ROC curves - only data with AWOL
+
+`r nrow(test_awol)` of `r nrow(res$test)` total samples have AWOL measurements.
+
+```{r awol_roc}
+sensitivities <- c()
+specificities <- c()
+thresholds <- c()
+model_names <- c()
+rocs <- list()
+for (model_name in models) {
+  test_preds <- data.frame(response=test_awol$delirium %>% as.numeric,
+                           prediction=res$awol_preds[[model_name]]$Yes %>% as.numeric)
+  test_roc <- roc(test_preds$response, test_preds$prediction)
+  sensitivities <- c(sensitivities, test_roc$sensitivities)
+  specificities <- c(specificities, test_roc$specificities)
+  thresholds <- c(thresholds, test_roc$thresholds)
+  rocs[[model_name]] <- test_roc
+  model_names <- c(model_names, rep(model_name, length(test_roc$thresholds)))
+}
+
+test_roc_awol <- data.frame(sens=c(sensitivities, awol_roc$sens),
+                            spec=c(specificities, awol_roc$spec),
+                            thresholds=c(thresholds, awol_roc$thresholds),
+                            model=c(model_names, rep("AWOL",length(awol_roc$thresholds))))
+
+ggplot(test_roc_awol, aes(spec, sens, color=model)) +
+  geom_line() +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  theme_bw() +
+  coord_fixed() +
+  scale_color_jama(name="Model", labels=c("AWOL",labels))
+```
+
+### DeLong's test for two correlated ROC curves
+
+```{r}
+# calculate significance of difference between GBM curve and AWOL curve
+roc.test(rocs$gbm, awol_roc)
+```
+
+```{r}
+roc.test(rocs$gbm, rocs$glmnet)
+```
+
+```{r}
+roc.test(rocs$gbm, rocs$rf)
+```
+
+```{r}
+roc.test(rocs$glmnet, rocs$rf)
+```
+
+
+```{r}
+# at the AWOL>=2 sensitivity, determine what the GBM NNS is
+awol_idx <- which(!is.na(awol_test))
+preds <- data.frame(response=test_delirium[awol_idx],
+                    predictor=as.numeric(res$preds[[c("gbm","Yes")]])[awol_idx])
+awol_sens_threshold <- rocs$gbm$thresholds[min(which(rocs$gbm$sensitivities <= awol_roc$sensitivities[3]))]
+invis <- print_confusion_matrix(preds$response, preds$predictor, awol_sens_threshold)
+```
+
+
+### AWOL confusion matrix
+
+```{r}
+preds <- data.frame(response=test_awol$delirium,
+                    predictor=test_awol$first_awol %>% as.numeric/4)
+model_roc <- roc(response=preds$response,
+                 predictor=preds$predictor)
+
+threshold <- 0.9
+# print confusion matrices at specificity thresholds
+spec_idx <- 3 # AWOL=2 threshold
+spec_threshold <- model_roc$thresholds[spec_idx]
+print(sprintf("%s specificity threshold: %s probability of delirium", threshold, percent(spec_threshold)))
+invis <- print_confusion_matrix(preds$response, preds$predictor, spec_threshold)
+```
+
+# Test performance - Nu-DESC > 0
+
+We compare the performance of each best cross-validated model on the test data. There are  `r nrow(res$test)` test examples.
+
+## AUCs
+```{r plot_aucs_nudesc1}
+awol_roc <- pROC::roc(as.numeric(test_awol_nudesc1$delirium), as.numeric(test_awol_nudesc1$first_awol), plot=FALSE)
+awol_auc <- awol_roc$auc
+
+df <- data.frame(model=c(rep(names(res_nudesc1$aucs), 2), "AWOL"),
+                 AUC=c(res_nudesc1$aucs, res_nudesc1$awol_aucs, awol_auc),
+                 data=c(rep("All", length(models)),rep("AWOL", length(models) + 1)))
+ggplot(df, aes(model, AUC, fill=data)) +
+  geom_bar(stat="identity", position="dodge") +
+  geom_text(aes(label=round(AUC,3)), position=position_dodge(width=0.9), vjust=-0.25) +
+  theme_bw() +
+  scale_fill_jama() +
+  scale_x_discrete(labels=c("AWOL",labels))
+```
+
+## ROC curves - all data
+```{r all_roc_nudesc1}
+sensitivities <- c()
+specificities <- c()
+thresholds <- c()
+model_names <- c()
+
+rocs_nudesc1 <- list()
+
+for (model_name in models) {
+  test_preds <- data.frame(response=test_delirium_nudesc1,
+                           prediction=as.numeric(res_nudesc1$preds[[model_name]]$Yes))
+  test_roc <- roc(test_preds$response, test_preds$prediction)
+  sensitivities <- c(sensitivities, test_roc$sensitivities)
+  specificities <- c(specificities, test_roc$specificities)
+  thresholds <- c(thresholds, test_roc$thresholds)
+  model_names <- c(model_names, rep(model_name, length(test_roc$thresholds)))
+  rocs_nudesc1[[model_name]] <- test_roc
+}
+
+all_roc <- data.frame(sens=sensitivities,
+                      spec=specificities,
+                      thresholds=thresholds,
+                      model=model_names)
+
+ggplot(all_roc, aes(spec, sens, color=model)) +
+  geom_line() +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  theme_bw() +
+  coord_fixed() +
+  scale_color_jama(name="Model", labels=labels)
+```
+
+## ROC curves - only data with AWOL
+
+`r nrow(test_awol)` of `r nrow(res_nudesc1$test)` total samples have AWOL measurements.
+
+```{r awol_roc_nudesc1}
+sensitivities <- c()
+specificities <- c()
+thresholds <- c()
+model_names <- c()
+for (model_name in models) {
+  test_preds <- data.frame(response=test_awol_nudesc1$delirium %>% as.numeric,
+                           prediction=res_nudesc1$awol_preds[[model_name]]$Yes %>% as.numeric)
+  test_roc <- roc(test_preds$response, test_preds$prediction)
+  sensitivities <- c(sensitivities, test_roc$sensitivities)
+  specificities <- c(specificities, test_roc$specificities)
+  thresholds <- c(thresholds, test_roc$thresholds)
+  model_names <- c(model_names, rep(model_name, length(test_roc$thresholds)))
+}
+
+test_roc_awol <- data.frame(sens=c(sensitivities, awol_roc$sens),
+                            spec=c(specificities, awol_roc$spec),
+                            thresholds=c(thresholds, awol_roc$thresholds),
+                            model=c(model_names, rep("AWOL",length(awol_roc$thresholds))))
+
+ggplot(test_roc_awol, aes(spec, sens, color=model)) +
+  geom_line() +
+  xlab("Specificity") +
+  ylab("Sensitivity") +
+  theme_bw() +
+  coord_fixed() +
+  scale_color_jama(name="Model", labels=c("AWOL",labels))
+```
+
+## DeLong's test for significance between ROC curves for Nu-DESC>0 and Nu-DESC>1
+```{r}
+for (model in names(rocs)) {
+  print(model)
+  print(roc.test(rocs[[model]], rocs_nudesc1[[model]]))
+}
+```
+
+
+# Model details - Nu-DESC > 1
+
+## glmnet
+
+### Model predictors
+
+There are `r predictors(res[[c("fits", "glmnet")]]) %>% length` predictors in the model.
+
+### Confusion matrices
+```{r}
+print_confusion_matrices("glmnet")
+```
+
+## gbm
+
+There are `r predictors(res[[c("fits", "gbm")]]) %>% length` predictors in the model.
+
+### Confusion matrices
+```{r}
+print_confusion_matrices("gbm")
+```
+
+### Confusion matrix for Nu-DESC > 0
+```{r}
+model <- "gbm"
+threshold <- 0.9
+preds <- data.frame(response=test_delirium_nudesc1,
+                    predictor=as.numeric(res_nudesc1$preds[[c(model,"Yes")]]))
+model_roc <- roc(response=preds$response,
+                 predictor=preds$predictor)
+# print confusion matrices at specificity thresholds
+spec_idx <- min(which(model_roc$specificities > threshold))
+spec_threshold <- model_roc$thresholds[spec_idx]
+print(sprintf("%s specificity threshold: %s probability of delirium", threshold, percent(spec_threshold)))
+invis <- print_confusion_matrix(preds$response, preds$predictor, spec_threshold)
+```
+
+## rf
+```{r}
+print_confusion_matrices("rf")
+```
+There are `r predictors(res[[c("fits", "rf")]]) %>% length` predictors in the model.
+
+### Confusion matrices
+```{r}
+print_confusion_matrices("rf")
+```
+
+```{r sessionInfo}
+sessionInfo()
+```
+
